@@ -1,10 +1,12 @@
-﻿using System.Text;
+﻿using System.Diagnostics;
+using System.Text;
 
 namespace Discord_Time_Tracker
 {
     public class ForegroundWindowTracker : IDisposable
     {
         const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+        const uint EVENT_OBJECT_NAMECHANGE = 0x800C;
         const uint WINEVENT_OUTOFCONTEXT = 0x0000;
 
         public event EventHandler<ForegroundWindowChangedEventArgs>? ForegroundWindowChanged;
@@ -16,7 +18,7 @@ namespace Discord_Time_Tracker
             _callback = WinEventProc;
             _hook = WinApiHelper.SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND,
-                EVENT_SYSTEM_FOREGROUND,
+                EVENT_OBJECT_NAMECHANGE,
                 IntPtr.Zero,
                 _callback,
                 0,
@@ -33,12 +35,30 @@ namespace Discord_Time_Tracker
             uint dwEventThread,
             uint dwmsEventTime)
         {
-            if (hwnd == IntPtr.Zero)
+            if (hwnd == IntPtr.Zero || idObject != 0)
+                return;
+
+            if (!WinApiHelper.IsWindowVisible(hwnd))
+                return;
+
+            WinApiHelper.GetWindowThreadProcessId(hwnd, out uint pid);
+
+            Process proc;
+            try
+            {
+                proc = Process.GetProcessById((int)pid);
+            }
+            catch
             {
                 return;
             }
 
+            if (!proc.ProcessName.Equals("Discord", StringComparison.OrdinalIgnoreCase))
+                return;
+
             string title = GetWindowTitle(hwnd);
+            if (string.IsNullOrWhiteSpace(title))
+                return;
 
             OnForegroundWindowChanged(hwnd, title);
         }
@@ -49,6 +69,7 @@ namespace Discord_Time_Tracker
             WinApiHelper.GetWindowTextW(hwnd, sb, sb.Capacity);
             return sb.ToString();
         }
+
 
         protected virtual void OnForegroundWindowChanged(IntPtr hwnd, string title)
         {

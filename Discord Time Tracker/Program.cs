@@ -1,107 +1,181 @@
 ﻿using System.Diagnostics;
+using System.Runtime.Versioning;
+using System.Text;
 
 namespace Discord_Time_Tracker
 {
     internal class Program
     {
         private static readonly object _stateLock = new();
-        static void Main(string[] args)
-        {
-            Stopwatch timer = new Stopwatch();
-            TimeSpan timeSpent = TimeSpan.Zero;
-            bool wasDiscordActive = false;
-            bool exitRequested = false;
+        private static readonly ManualResetEventSlim _exitEvent = new(false);
 
-            WinApiHelper.MessageBoxW(IntPtr.Zero,
-                "Your time spent on Discord is now being tracked! Press E to stop tracking and end program.",
+        private static readonly Dictionary<string, TimeSpan> _serverTimes = new();
+
+        private static string? _currentServer;
+        private static DateTime _serverStartedAt;
+        private static bool _wasDiscordActive;
+
+        [SupportedOSPlatform("Windows")]
+        static void Main()
+        {
+            WinApiHelper.MessageBoxW(
+                IntPtr.Zero,
+                "Tracking Discord time.\nPress E to stop.",
                 "Discord Time Tracker",
-                (uint)(MessageBoxType.MB_OK | MessageBoxType.MB_ICONINFO));
+                (uint)(MessageBoxType.MB_OK | MessageBoxType.MB_ICONINFO)
+            );
 
             uint hookThreadId = 0;
+
             Thread hookThread = new Thread(() =>
             {
                 hookThreadId = WinApiHelper.GetCurrentThreadId();
-                using var windowTracker = new ForegroundWindowTracker();
-                windowTracker.ForegroundWindowChanged += (_, e) =>
-                {
-                    bool isDiscordActive = IsDiscordActive();
 
-                    lock (_stateLock)
-                    {
-                        if (isDiscordActive && !wasDiscordActive)
-                        {
-                            timer.Start();
-                        }
-                        else if (!isDiscordActive && wasDiscordActive)
-                        {
-                            timer.Stop();
-                            timeSpent += timer.Elapsed;
-                            timer.Reset();
-                        }
-
-                        wasDiscordActive = isDiscordActive;
-                    }
-                };
+                using var tracker = new ForegroundWindowTracker();
+                tracker.ForegroundWindowChanged += OnForegroundWindowChanged;
 
                 MSG msg;
-                while (!exitRequested && WinApiHelper.GetMessage(out msg, IntPtr.Zero, 0, 0) != 0)
+                while (!_exitEvent.IsSet &&
+                       WinApiHelper.GetMessage(out msg, IntPtr.Zero, 0, 0) != 0)
                 {
                     WinApiHelper.TranslateMessage(ref msg);
                     WinApiHelper.DispatchMessage(ref msg);
                 }
             });
-            if (OperatingSystem.IsWindows())
-            {
-                hookThread.SetApartmentState(ApartmentState.STA);
-            }
+
+            hookThread.SetApartmentState(ApartmentState.STA);
             hookThread.Start();
 
+            // Input thread
             Thread inputThread = new Thread(() =>
             {
-                while (!exitRequested)
+                while (true)
                 {
-                    if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.E)
-                        exitRequested = true;
-                    Thread.Sleep(50);
+                    if (Console.ReadKey(true).Key == ConsoleKey.E)
+                    {
+                        _exitEvent.Set();
+                        break;
+                    }
                 }
             });
             inputThread.Start();
 
-            inputThread.Join();
-            WinApiHelper.PostThreadMessage(hookThreadId, WinApiHelper.WM_QUIT, UIntPtr.Zero, IntPtr.Zero);
+
+            _exitEvent.Wait();
+
+            WinApiHelper.PostThreadMessage(
+                hookThreadId,
+                WinApiHelper.WM_QUIT,
+                UIntPtr.Zero,
+                IntPtr.Zero
+            );
+
             hookThread.Join();
 
-            if (timer.IsRunning)
+
+            lock (_stateLock)
             {
-                lock (_stateLock)
+                if (_currentServer != null)
                 {
-                    timer.Stop();
-                    timeSpent += timer.Elapsed;
-                    timer.Reset();
+                    var elapsed = DateTime.UtcNow - _serverStartedAt;
+                    AddTime(_currentServer, elapsed);
+                    _currentServer = null;
                 }
             }
 
-            WinApiHelper.MessageBoxW(
-                IntPtr.Zero,
-                $"Total time spent on Discord: {timeSpent:hh\\:mm\\:ss}",
-                "Discord Time Tracker",
-                (uint)(MessageBoxType.MB_OK | MessageBoxType.MB_ICONINFO)
-            );
+            ShowResults();
+        }
+        private static void OnForegroundWindowChanged(object? sender, ForegroundWindowChangedEventArgs e)
+        {
+            lock (_stateLock)
+            {
+                bool isDiscordActive = IsDiscordActive();
+
+                if (!isDiscordActive)
+                {
+
+                    if (_currentServer != null)
+                    {
+                        var elapsed = DateTime.UtcNow - _serverStartedAt;
+                        AddTime(_currentServer, elapsed);
+                        _currentServer = null;
+                    }
+
+                    _wasDiscordActive = false;
+                    return;
+                }
+
+                string newServer = e.Title;
+
+                if (!_wasDiscordActive)
+                {
+
+                    _currentServer = newServer;
+                    _serverStartedAt = DateTime.UtcNow;
+                    _wasDiscordActive = true;
+                    return;
+                }
+
+                if (_currentServer != newServer)
+                {
+
+                    if (_currentServer != null)
+                    {
+                        var elapsed = DateTime.UtcNow - _serverStartedAt;
+                        AddTime(_currentServer, elapsed);
+                    }
+
+                    _currentServer = newServer;
+                    _serverStartedAt = DateTime.UtcNow;
+                }
+            }
         }
 
-        static bool IsDiscordActive()
+        private static void AddTime(string server, TimeSpan elapsed)
         {
-            IntPtr openWindowHandle = WinApiHelper.GetForegroundWindow();
-            if (openWindowHandle == IntPtr.Zero)
+            if (_serverTimes.TryGetValue(server, out var existing))
+                _serverTimes[server] = existing + elapsed;
+            else
+                _serverTimes[server] = elapsed;
+        }
+
+        private static bool IsDiscordActive()
+        {
+            IntPtr hwnd = WinApiHelper.GetForegroundWindow();
+            if (hwnd == IntPtr.Zero)
+                return false;
+
+            WinApiHelper.GetWindowThreadProcessId(hwnd, out uint pid);
+
+            try
+            {
+                var proc = Process.GetProcessById((int)pid);
+                return proc.ProcessName.Equals("Discord", StringComparison.OrdinalIgnoreCase);
+            }
+            catch
             {
                 return false;
             }
+        }
 
-            uint processId;
-            WinApiHelper.GetWindowThreadProcessId(openWindowHandle, out processId);
+        private static void ShowResults()
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("Time per server:\n");
+            TimeSpan totalTime = TimeSpan.Zero;
+            foreach (var kvp in _serverTimes.Where(kvp => kvp.Key.Contains("Discord", StringComparison.OrdinalIgnoreCase)))
+            {
+                sb.AppendLine($"{kvp.Key.Replace(" - Discord", "")} : {kvp.Value:hh\\:mm\\:ss}");
+                totalTime += kvp.Value;
+            }
+            sb.AppendLine($"Total time spent: {totalTime:hh\\:mm\\:ss}");
 
-            Process activeProcess = Process.GetProcessById((int)processId);
-            return activeProcess.ProcessName.Equals("Discord", StringComparison.OrdinalIgnoreCase);
+            WinApiHelper.MessageBoxW(
+                IntPtr.Zero,
+                sb.ToString(),
+                "Discord Time Tracker",
+                (uint)(MessageBoxType.MB_OK | MessageBoxType.MB_ICONINFO)
+            );
         }
     }
 }
